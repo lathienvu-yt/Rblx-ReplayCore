@@ -1,4 +1,4 @@
-# Rblx-ReplayCore
+# Roblox ReplayCore
 
 A modern Roblox replay system for competitive gaming and replay-heavy experiences.
 
