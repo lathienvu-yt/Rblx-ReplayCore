@@ -44,7 +44,7 @@ local FLUSH_INTERVAL = 2              -- Seconds between ring buffer flush check
 --------------------------------------------------
 local LIVE_SNAPSHOT_CHUNK_SIZE = 12000
 local REPLAY_SEQUENCE_CHUNK_SIZE = 50
-local REPLAY_LIVE_TTL = 120
+local REPLAY_LIVE_TTL = 30
 local REPLAY_LIVE_VALUE_LIMIT = 7000
 local REPLAY_LIVE_TOTAL_BUDGET = 14000
 
@@ -1248,7 +1248,7 @@ local function writeLiveSequenceChunk(matchId, chunkIndex, frames)
 		end)
 
 		if not ok then
-			warn("[ReplayHybrid] Failed writing LIVE chunk:", matchId, chunkIndex, partIndex, err)
+			warn("[ReplayHybrid] Failed writing LIVE chunk to MemoryStore (forced fallback to DataStore):", matchId, chunkIndex, partIndex, err)
 			removeLiveSequenceChunk(matchId, chunkIndex, partIndex)
 			return false
 		end
@@ -1292,7 +1292,7 @@ local function writeLiveSequenceChunk(matchId, chunkIndex, frames)
 	end)
 
 	if not ok then
-		warn("[ReplayHybrid] Failed updating LIVE index:", matchId, err)
+		warn("[ReplayHybrid] Failed updating LIVE index in MemoryStore (forced fallback to DataStore):", matchId, err)
 		removeLiveSequenceChunk(matchId, chunkIndex, #parts)
 		return false
 	end
@@ -1596,11 +1596,32 @@ local function startReplayProcessor(stream)
 					local manifest = loadReplayPayload(stream.replayChunkKey)
 
 					if type(manifest) ~= "table" then
-						warn(
-							"[ReplayCoreServer] LIVE manifest missing while updating:",
-							stream.replayChunkKey
-						)
-						return
+						manifest = {
+							kind = "ReplayManifest",
+							version = 2,
+							isLive = true,
+							liveMatchId = stream.liveMatchId,
+							chunkKey = stream.replayChunkKey,
+							replayId = stream.replayChunkKey,
+							chunkSize = REPLAY_SEQUENCE_CHUNK_SIZE,
+							totalChunks = stream.processedUntil + 1,
+							totalFrames = stream.processedFrames,
+							totalDuration = tonumber(stream.processedLastTime) or tonumber(stream.lastTime) or 0,
+							lastSeq = tonumber(stream.latestSeq) or 0,
+							fps = 60,
+							mapSeed = stream.mapSeed,
+							mapMode = stream.mapMode,
+							recorderUserId = stream.recorderUserId,
+							players = stream.replayPlayers or {},
+							sounds = stream.sounds or {},
+							markers = {},
+							multiplayer = stream.multiplayer == true,
+							processedUntil = stream.processedUntil,
+							liveUntilChunk = stream.liveUntilChunk,
+							processedUntilTime = tonumber(stream.processedLastTime) or 0,
+							liveUntilTime = tonumber(stream.lastTime) or 0,
+							Timestamp = os.time(),
+						}
 					end
 
 					manifest.kind = "ReplayManifest"
@@ -1623,9 +1644,12 @@ local function startReplayProcessor(stream)
 					manifest.totalFrames = stream.processedFrames
 
 					manifest.totalDuration =
-						tonumber(stream.processedLastTime)
-						or tonumber(stream.lastTime)
-						or 0
+						math.max(
+							tonumber(manifest.totalDuration) or 0,
+							tonumber(stream.processedLastTime)
+							or tonumber(stream.lastTime)
+							or 0
+						)
 
 					manifest.lastSeq =
 						tonumber(stream.latestSeq)
@@ -1694,6 +1718,7 @@ local function startReplayProcessor(stream)
 						lastTime = stream.processedLastTime,
 					}
 				)
+				removeLiveSequenceChunk(stream.liveMatchId, nextIndex, 10)
 
 				nextIndex += 1
 				stream.nextProcessChunk = nextIndex
@@ -1959,6 +1984,42 @@ local function buildReplayStatus(replayKey, matchId)
 	}
 
 	--------------------------------------------------
+	-- CHECK LOCAL ACTIVE STREAM
+	--------------------------------------------------
+	local liveStream = nil
+	if matchId then
+		for _, s in pairs(activeStreams) do
+			if s.liveMatchId == matchId or s.replayChunkKey == replayKey then
+				liveStream = s
+				break
+			end
+		end
+	end
+	if not liveStream and replayKey then
+		for _, s in pairs(activeStreams) do
+			if s.replayChunkKey == replayKey then
+				liveStream = s
+				break
+			end
+		end
+	end
+
+	if liveStream then
+		status.isLive = true
+		status.liveFromChunk = status.liveFromChunk or liveStream.liveFromChunk or 0
+		status.liveUntilChunk = math.max(status.liveUntilChunk or -1, liveStream.liveUntilChunk or 0)
+		status.liveFromTime = status.liveFromTime or liveStream.firstTime or 0
+		status.liveUntilTime = math.max(status.liveUntilTime or 0, liveStream.lastTime or 0)
+		status.processedUntilChunk = math.max(status.processedUntilChunk or -1, liveStream.processedUntil or -1)
+		status.processedUntilTime = math.max(status.processedUntilTime or 0, liveStream.processedLastTime or 0)
+		status.totalDuration = math.max(status.totalDuration or 0, liveStream.lastTime or 0, liveStream.processedLastTime or 0)
+		status.totalFrames = math.max(status.totalFrames or 0, (liveStream.metrics and liveStream.metrics.framesReceived) or (liveStream.frames and #liveStream.frames) or 0)
+		for idx, st in pairs(liveStream.sequenceStates or {}) do
+			status.chunkStates[idx] = st
+		end
+	end
+
+	--------------------------------------------------
 	-- LOAD LIVE INDEX
 	--------------------------------------------------
 
@@ -2015,10 +2076,10 @@ local function buildReplayStatus(replayKey, matchId)
 		--------------------------------------------------
 
 		status.processedUntilChunk =
-			calculateProcessedUntil(indexData)
+			math.max(status.processedUntilChunk, calculateProcessedUntil(indexData))
 
 		status.processedUntilTime =
-			tonumber(indexData.processedUntilTime) or 0
+			math.max(status.processedUntilTime, tonumber(indexData.processedUntilTime) or 0)
 
 
 		if status.processedUntilChunk >= 0 then
@@ -2056,16 +2117,16 @@ local function buildReplayStatus(replayKey, matchId)
 		if type(manifest) == "table" then
 
 			status.totalDuration =
-				tonumber(manifest.totalDuration) or 0
+				math.max(status.totalDuration, tonumber(manifest.totalDuration) or 0)
 
 			status.totalFrames =
-				tonumber(manifest.totalFrames) or 0
+				math.max(status.totalFrames, tonumber(manifest.totalFrames) or 0)
 
 			status.totalChunks =
-				tonumber(
+				math.max(status.totalChunks, tonumber(
 					manifest.totalChunks
 					or manifest.chunkCount
-				) or 0
+				) or 0)
 
 			status.fps =
 				tonumber(manifest.fps)
@@ -2092,13 +2153,14 @@ local function buildReplayStatus(replayKey, matchId)
 	-- LIVE RANGE MUST NEVER PRETEND TO BE VOD
 	--------------------------------------------------
 
-	if status.isLive
-		and status.liveUntilChunk >= 0
-	then
-		-- Do NOT mark the live chunk as processed.
-		if status.processedUntilChunk >= status.liveUntilChunk then
-			status.processedUntilChunk =
-				status.liveUntilChunk - 1
+	if status.isLive then
+		status.totalDuration = math.max(status.totalDuration or 0, status.liveUntilTime or 0, status.processedUntilTime or 0)
+		if status.liveUntilChunk >= 0 then
+			-- Do NOT mark the live chunk as processed.
+			if status.processedUntilChunk >= status.liveUntilChunk then
+				status.processedUntilChunk =
+					status.liveUntilChunk - 1
+			end
 		end
 	end
 
@@ -3056,6 +3118,8 @@ local function publishMessage(topic, data)
 	return true
 end
 
+local flushReplaySequenceBuffers
+
 local function sendLiveSnapshot(requesterJobId, matchId, requestId)
 	local match = liveMatches[matchId]
 
@@ -3077,13 +3141,75 @@ local function sendLiveSnapshot(requesterJobId, matchId, requestId)
 	end
 
 	local snapshotFrames = {}
+	local seenSequences = {}
+
+	local function appendSnapshotFrame(frame)
+		if type(frame) ~= "table" then
+			return
+		end
+
+		local seq = tonumber(frame.seq)
+		if seq and seenSequences[seq] then
+			return
+		end
+		if seq then
+			seenSequences[seq] = true
+		end
+		table.insert(snapshotFrames, frame)
+	end
+
+	-- Include chunks waiting for the live writer as well as frames waiting in
+	-- the replay processor. A snapshot request may race either asynchronous job.
+	for _, chunk in ipairs(match.writeQueue or {}) do
+		for _, frame in ipairs(chunk) do
+			appendSnapshotFrame(frame)
+		end
+	end
 
 	for _, entry in ipairs(stream.frames or {}) do
-		if type(entry) == "table" and entry.frame then
-			table.insert(snapshotFrames, entry.frame)
-		elseif type(entry) == "table" then
-			table.insert(snapshotFrames, entry)
+		appendSnapshotFrame(type(entry) == "table" and entry.frame or entry)
+	end
+
+	for _, frame in ipairs(stream.segmentBuffer or {}) do
+		appendSnapshotFrame(frame)
+	end
+
+	for _, buffer in pairs(stream.sequenceBuffers or {}) do
+		for _, frame in ipairs(buffer) do
+			appendSnapshotFrame(frame)
 		end
+	end
+
+	for _, job in pairs(stream.processingQueue or {}) do
+		for _, frame in ipairs(type(job) == "table" and job.frames or {}) do
+			appendSnapshotFrame(frame)
+		end
+	end
+
+	table.sort(snapshotFrames, function(a, b)
+		return (tonumber(a.seq) or math.huge) < (tonumber(b.seq) or math.huge)
+	end)
+
+	print(
+		"[LivePlayCore] Snapshot frame payload:",
+		"count =",
+		#snapshotFrames,
+		"firstSeq =",
+		snapshotFrames[1] and snapshotFrames[1].seq or "nil",
+		"lastSeq =",
+		snapshotFrames[#snapshotFrames] and snapshotFrames[#snapshotFrames].seq or "nil"
+	)
+
+	if #snapshotFrames == 0 then
+		warn(
+			"[LivePlayCore] Empty snapshot payload:",
+			matchId,
+			"received =", stream.metrics and stream.metrics.framesReceived or 0,
+			"writeQueue =", #(match.writeQueue or {}),
+			"ring =", #(stream.frames or {}),
+			"segmentBuffer =", #(stream.segmentBuffer or {}),
+			"processingQueue =", next(stream.processingQueue or {}) ~= nil
+		)
 	end
 
 	local snapshot = {
@@ -4284,17 +4410,18 @@ ReplayEvent.OnServerEvent:Connect(function(player, command, arg1, arg2, arg3)
 
 			if existingStream then
 				warn(
-					"[ReplayCoreServer] Player already has active stream:",
+					"[ReplayCoreServer] Player started new stream, cleaning up previous stream:",
 					player.Name,
 					existingStreamId,
 					"->",
 					streamId
 				)
-
-				return
+				if existingStream.liveMatchId then
+					endLiveMatch(existingStream.liveMatchId)
+				end
+				activeStreams[existingStreamId] = nil
 			end
 
-			-- Stale mapping
 			activeStreamByUser[userId] = nil
 		end
 
@@ -4385,6 +4512,9 @@ ReplayEvent.OnServerEvent:Connect(function(player, command, arg1, arg2, arg3)
 				processingQueue = {},
 				nextProcessChunk = 0,
 
+				receivedSeq = {},
+				receivedContiguousSeq = 0,
+
 				processedUntil = -1,
 				processedFrames = 0,
 				processedLastTime = 0,
@@ -4426,6 +4556,8 @@ ReplayEvent.OnServerEvent:Connect(function(player, command, arg1, arg2, arg3)
 				registerLiveMatch(stream, metadata)
 
 			startRingFlushTask(stream)
+
+			ReplayEvent:FireClient(player, "StartStreamAccepted", streamId, stream.liveMatchId)
 
 			print(
 				"[ReplayCoreServer] Live Stream started:",
@@ -4488,19 +4620,46 @@ ReplayEvent.OnServerEvent:Connect(function(player, command, arg1, arg2, arg3)
 		if stream and type(frameChunk) == "table" then
 			local metrics = stream.metrics or {}
 
+			print(
+				"[ReplayCoreServer] StreamChunk received:",
+				streamId,
+				"frames =",
+				#frameChunk,
+				"firstSeq =",
+				frameChunk[1] and frameChunk[1].seq or "nil",
+				"lastSeq =",
+				frameChunk[#frameChunk] and frameChunk[#frameChunk].seq or "nil"
+			)
+
 			for _, frame in ipairs(frameChunk) do
+				if type(frame) ~= "table" then
+					continue
+				end
+
 				pushFrameToRing(stream, frame)
 
 				local seq = tonumber(frame.seq) or 0
 				if seq > 0 then
-					if metrics.lastSeq > 0 and seq > metrics.lastSeq + 1 then
-						metrics.lostFrames += (seq - metrics.lastSeq - 1)
+					if not stream.receivedSeq[seq] then
+						stream.receivedSeq[seq] = true
+						metrics.framesReceived += 1
 					end
+
 					if seq > metrics.lastSeq then
 						metrics.lastSeq = seq
 					end
+
+					while stream.receivedSeq[(stream.receivedContiguousSeq or 0) + 1] do
+						stream.receivedContiguousSeq += 1
+					end
+
+					metrics.lostFrames = math.max(
+						0,
+						metrics.lastSeq - (stream.receivedContiguousSeq or 0)
+					)
+				else
+					metrics.framesReceived += 1
 				end
-				metrics.framesReceived += 1
 
 				if type(frame.st) == "number" then
 					local latency = workspace:GetServerTimeNow() - frame.st
@@ -4515,6 +4674,12 @@ ReplayEvent.OnServerEvent:Connect(function(player, command, arg1, arg2, arg3)
 			if stream.liveMatchId then
 				pushLiveFrames(stream.liveMatchId, frameChunk)
 				queueReplayFrames(stream, frameChunk)
+			end
+
+			local highestSeq = tonumber(metrics.lastSeq) or 0
+			ReplayEvent:FireClient(player, "StreamAck", streamId, highestSeq)
+			if (stream.receivedContiguousSeq or 0) + 1 < highestSeq then
+				ReplayEvent:FireClient(player, "StreamResync", streamId, stream.receivedContiguousSeq or 0, highestSeq)
 			end
 		end
 
