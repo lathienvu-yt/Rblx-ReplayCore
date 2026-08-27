@@ -25,6 +25,10 @@ local frameSeq = 0
 local streamId = nil
 
 local pendingFrames = {}
+local sentChunks = {}
+local lastStreamAckAt = 0
+local lastStreamAckSeq = 0
+local streamRecoveryAttempts = 0
 local deathConnections = {}
 
 local hasFirstFrame = false
@@ -36,7 +40,9 @@ local previousCameraPos
 local previousCameraLook
 
 local MULTIPLAYER_RECORD_RADIUS = 180
-local CHUNK_SIZE = 100
+local CHUNK_SIZE = 50
+local STREAM_ACK_TIMEOUT = 4
+local STREAM_RECOVERY_INTERVAL = 2
 local MAX_RECORDING_TIME = 180
 local KEYFRAME_INTERVAL = 30
 
@@ -939,19 +945,36 @@ local function StartRecording(seed, mapMode, isMultiplayer)
 	}
 
 	pendingFrames = {}
+	sentChunks = {}
+	lastStreamAckAt = os.clock()
+	lastStreamAckSeq = 0
+	streamRecoveryAttempts = 0
 	hasFirstFrame = false
 
 	startTime = workspace:GetServerTimeNow()
 	frameCounter = 0
 	frameSeq = 0
 	isRecording = true
+	streamStartPending = true
+	streamAccepted = false
 
 	ReplayEvent:FireServer("StartStream", streamId, replayData)
-	ReplayEvent:FireServer("EnableCameraCapture", streamId)
 end
-
+local function sendStreamChunk(chunk)
+	if not streamId or not chunk or #chunk == 0 then return end
+	ReplayEvent:FireServer("StreamChunk", streamId, chunk)
+end
 local function StopAndSaveRecording(reason)
 	if not isRecording then return end
+	if streamStartPending and not streamAccepted then
+		warn("[ReplaySystem] STOP RECORDING: StartStream was not acknowledged")
+		isRecording = false
+		streamStartPending = false
+		streamAccepted = false
+		streamId = nil
+		pendingFrames = {}
+		return
+	end
 	isRecording = false
 
 	warn(
@@ -970,8 +993,9 @@ local function StopAndSaveRecording(reason)
 	end
 
 	if #pendingFrames > 0 then
-		ReplayEvent:FireServer("StreamChunk", streamId, pendingFrames)
+		local chunk = pendingFrames
 		pendingFrames = {}
+		sendStreamChunk(chunk)
 	end
 
 	ReplayEvent:FireServer(
@@ -988,7 +1012,7 @@ local function StopAndSaveRecording(reason)
 end
 
 RunService.Heartbeat:Connect(function()
-	if not isRecording then return end
+	if not isRecording or not streamAccepted then return end
 
 	if workspace:GetServerTimeNow() - startTime > MAX_RECORDING_TIME then
 		StopAndSaveRecording("Max time reached")
@@ -1186,6 +1210,10 @@ local livePlayback = {
 	frameIndex = 1,
 	dummies = {},
 	focusKey = nil,
+	metricsLatencySamples = {},
+	metricsMaxExpectedSeq = 0,
+	metricsLostFrames = 0,
+	metricsReceivedFrames = 0,
 }
 local livePendingData = nil
 local livePlaybackOffset = Vector3.zero
@@ -1617,15 +1645,23 @@ end
 
 local function getFrameIndexForTime(frames, targetTime)
 	if #frames == 0 then return 1 end
-	local targetIndex = 1
-	for i = 1, #frames do
-		if frames[i].t <= targetTime then
-			targetIndex = i
+	targetTime = tonumber(targetTime) or 0
+	local low = 1
+	local high = #frames
+	local result = 1
+
+	while low <= high do
+		local middle = math.floor((low + high) / 2)
+		local frameTime = tonumber(frames[middle].t) or 0
+		if frameTime <= targetTime then
+			result = middle
+			low = middle + 1
 		else
-			break
+			high = middle - 1
 		end
 	end
-	return targetIndex
+
+	return result
 end
 
 local function applyPOVCamera(timeline, offset)
@@ -1717,9 +1753,9 @@ end
 
 -- Decode a single frame into an absolute per-part state, given the previous
 -- absolute state (so delta-encoded frames resolve correctly).
-local function getAbsolutePlayerState(frame, prevState)
+local function getAbsolutePlayerState(playerData, prevState)
 	local state = {}
-	for partName, partData in pairs(frame.parts or {}) do
+	for partName, partData in pairs((playerData and playerData.parts) or {}) do
 		if type(partData) ~= "table" then continue end
 		if partData.p and partData.r then
 			state[partName] = {
@@ -2579,6 +2615,10 @@ local function stopLivePlayback()
 	livePlayback.active = false
 	livePlayback.data = nil
 	livePlayback.dummies = {}
+	livePlayback.metricsLatencySamples = {}
+	livePlayback.metricsMaxExpectedSeq = 0
+	livePlayback.metricsLostFrames = 0
+	livePlayback.metricsReceivedFrames = 0
 	stopPlayback()
 	if _G.SetReplayStatus then _G.SetReplayStatus("Status: Live playback ended", C.TextDim, C.TextDim) end
 end
@@ -2601,6 +2641,10 @@ local function InitializeLivePlayback(data, offset)
 	livePlayback.offset = offset
 	livePlayback.frameIndex = 1
 	livePlayback.focusKey = tostring(data.recorderUserId or Player.UserId)
+	livePlayback.metricsLatencySamples = {}
+	livePlayback.metricsMaxExpectedSeq = 0
+	livePlayback.metricsLostFrames = 0
+	livePlayback.metricsReceivedFrames = 0
 
 	stopPlayback()
 
@@ -2712,6 +2756,8 @@ local function InitializeLivePlayback(data, offset)
 			local liveFrom = tonumber(timeline.LiveFromTime)
 
 			if processedUntil
+				and processedUntil > 0
+				and (tonumber(timeline.ProcessedUntilChunk) or -1) >= 0
 				and liveFrom
 				and liveFrom > processedUntil
 				and timeline.CurrentTime > processedUntil
@@ -2746,27 +2792,26 @@ local function InitializeLivePlayback(data, offset)
 		local dummies = timeline.Dummies or {}
 		local currentFrame = frames[targetIndex]
 		local nextFrame = frames[math.min(targetIndex + 1, #frames)]
-		local alpha = 0
-		if nextFrame and currentFrame and nextFrame.t and currentFrame.t and nextFrame.t > currentFrame.t then
-			alpha = math.clamp((current - currentFrame.t) / (nextFrame.t - currentFrame.t), 0, 1)
-		end
-
-		for playerKey, dummy in pairs(dummies) do
-			local stateA = playbackPlayerState[playerKey]
-			local stateB = nextFrame and getAbsolutePlayerState(nextFrame, stateA) or stateA
-			applyInterpolatedStateToDummy(dummy, stateA, stateB, alpha, offset)
-		end
-
-		local currentFrame = frames[targetIndex]
-		timeline.CurrentTimer = currentFrame and currentFrame.timer or 0
-
-		local nextFrame = frames[math.min(targetIndex + 1, #frames)]
-		local frameStart = currentFrame and currentFrame.t or 0
-		local frameEnd = nextFrame and nextFrame.t or frameStart
+		local frameStart = currentFrame and tonumber(currentFrame.t) or 0
+		local frameEnd = nextFrame and tonumber(nextFrame.t) or frameStart
 		local alpha = 0
 		if frameEnd > frameStart then
 			alpha = math.clamp((current - frameStart) / (frameEnd - frameStart), 0, 1)
 		end
+
+		for playerKey, dummy in pairs(dummies) do
+			local stateA = playbackPlayerState[playerKey]
+			local stateB = stateA
+			if nextFrame then
+				local nextPlayerData = nextFrame.players and nextFrame.players[playerKey]
+				if nextPlayerData then
+					stateB = getAbsolutePlayerState(nextPlayerData, stateA)
+				end
+			end
+			applyInterpolatedStateToDummy(dummy, stateA, stateB, alpha, offset)
+		end
+
+		timeline.CurrentTimer = currentFrame and currentFrame.timer or 0
 
 		local interpolatedTimers = {}
 		for key, elapsed in pairs((currentFrame and currentFrame.timers) or {}) do
@@ -2787,8 +2832,15 @@ local function InitializeLivePlayback(data, offset)
 		end
 
 		-- Hold at the latest available frame until more live data arrives.
+		-- Mark as Buffering so AppendLiveFrames can resume playback once
+		-- new frames arrive, and the UI can show a spinner.
 		if current >= timeline.TotalDuration then
 			timeline.CurrentTime = timeline.TotalDuration
+			if not timeline.Buffering then
+				timeline.Buffering = true
+				timeline.IsPaused = true
+				timeline.AutoPausedForBuffer = true
+			end
 		end
 	end)
 end
@@ -2810,28 +2862,126 @@ local function AppendLiveFrames(frames, metrics)
 	local data = livePlayback.data
 	ensureTimelineTables(timeline)
 
+	-- Remember the identity of the frame the decoder is currently pointing at.
+	-- After inserting + sorting, if new frames landed before that cursor, the
+	-- incremental delta-decode chain is invalid and must be rebuilt.
+	local cursorFrameId = nil
+	local existingFrames = data.frames or {}
+	if playbackFrameIndex >= 1 and playbackFrameIndex <= #existingFrames then
+		local cf = existingFrames[playbackFrameIndex]
+		if cf then
+			cursorFrameId = cf.seq ~= nil and ("s:" .. tostring(cf.seq)) or ("t:" .. tostring(cf.t))
+		end
+	end
+
 	local seen = {}
-	for _, existing in ipairs(data.frames or {}) do
+	for _, existing in ipairs(existingFrames) do
 		if type(existing) == "table" then
 			local key = existing.seq ~= nil and "s:" .. tostring(existing.seq) or "t:" .. tostring(existing.t)
 			seen[key] = true
 		end
 	end
 
+	local insertedAny = false
 	for _, frame in ipairs(frames) do
 		if type(frame) == "table" then
 			local key = frame.seq ~= nil and "s:" .. tostring(frame.seq) or "t:" .. tostring(frame.t)
 			if not seen[key] then
 				seen[key] = true
 				table.insert(data.frames, frame)
+				insertedAny = true
 			end
 		end
 	end
 
-	-- Keep chronological order.
+	if not insertedAny then
+		if metrics then timeline.LiveMetrics = metrics end
+		return
+	end
+
+	-- Keep chronological order, with sequence as a stable tie-breaker.
 	table.sort(data.frames, function(a, b)
-		return (tonumber(a.t) or 0) < (tonumber(b.t) or 0)
+		local at = tonumber(a.t) or 0
+		local bt = tonumber(b.t) or 0
+		if at == bt then
+			return (tonumber(a.seq) or 0) < (tonumber(b.seq) or 0)
+		end
+		return at < bt
 	end)
+
+	--------------------------------------------------
+	-- PING + PACKET LOSS MEASUREMENT
+	--------------------------------------------------
+
+	if metrics then
+		timeline.LiveMetrics = metrics
+	else
+		local nowServerTime = workspace:GetServerTimeNow()
+		local LATENCY_WINDOW = 30
+
+		for _, frame in ipairs(frames) do
+			if type(frame) == "table" then
+				local st = tonumber(frame.st)
+				if st and st > 0 then
+					local latency = math.max(0, nowServerTime - st)
+					local samples = livePlayback.metricsLatencySamples
+					table.insert(samples, latency)
+					if #samples > LATENCY_WINDOW then
+						table.remove(samples, 1)
+					end
+				end
+
+				local seq = tonumber(frame.seq)
+				if seq then
+					livePlayback.metricsReceivedFrames += 1
+					if seq > livePlayback.metricsMaxExpectedSeq + 1 and livePlayback.metricsMaxExpectedSeq > 0 then
+						local gap = seq - livePlayback.metricsMaxExpectedSeq - 1
+						livePlayback.metricsLostFrames += gap
+					end
+					if seq > livePlayback.metricsMaxExpectedSeq then
+						livePlayback.metricsMaxExpectedSeq = seq
+					end
+				end
+			end
+		end
+
+		local avgLatencyMs = 0
+		local samples = livePlayback.metricsLatencySamples
+		if #samples > 0 then
+			local sum = 0
+			for _, s in ipairs(samples) do sum += s end
+			avgLatencyMs = math.floor((sum / #samples) * 1000)
+		end
+
+		if timeline.IsLive then
+			timeline.LiveMetrics = {
+				latencyMs = avgLatencyMs,
+				framesReceived = livePlayback.metricsReceivedFrames,
+				lostFrames = livePlayback.metricsLostFrames,
+			}
+		end
+	end
+
+	-- After the sort, find where the cursor frame ended up.
+	-- If new frames were inserted *before* the cursor, the accumulated
+	-- delta-decode state is now based on a wrong chain. Reset so the
+	-- render loop rebuilds cleanly from the nearest absolute keyframe.
+	if cursorFrameId ~= nil then
+		local newCursorIndex = nil
+		for i, f in ipairs(data.frames) do
+			local fId = f.seq ~= nil and ("s:" .. tostring(f.seq)) or ("t:" .. tostring(f.t))
+			if fId == cursorFrameId then
+				newCursorIndex = i
+				break
+			end
+		end
+		if newCursorIndex ~= nil and newCursorIndex ~= playbackFrameIndex then
+			-- Frames landed before the decoder cursor; the delta chain is broken.
+			warn("[LivePlayCore] Frame gap detected (cursor moved from", playbackFrameIndex, "to", newCursorIndex, "). Resetting decoder.")
+			resetPlaybackDecoder()
+			playbackFrameIndex = 0
+		end
+	end
 
 	--------------------------------------------------
 	-- Register incoming frames as loaded LIVE chunks
@@ -3075,7 +3225,25 @@ local function processPlaybackData(fullJsonData)
 end
 
 ReplayEvent.OnClientEvent:Connect(function(command, payload, extra, extra2, extra3, extra4, extra5)
-	if command == "PlaybackFailed" then
+	if command == "StartStreamAccepted" then
+		local acceptedStreamId = payload
+		if isRecording and (acceptedStreamId == streamId or not streamId) then
+			streamAccepted = true
+			streamStartPending = false
+			lastStreamAckAt = os.clock()
+		end
+		return
+	elseif command == "StreamAck" then
+		local ackStreamId = payload
+		local ackSeq = tonumber(extra) or 0
+		if isRecording and ackStreamId == streamId then
+			lastStreamAckAt = os.clock()
+			if ackSeq > lastStreamAckSeq then
+				lastStreamAckSeq = ackSeq
+			end
+		end
+		return
+	elseif command == "PlaybackFailed" then
 		local reason = tostring(payload or "Playback failed.")
 		warn("[ReplaySystem] " .. reason)
 		stopPlayback()
@@ -3259,44 +3427,57 @@ ReplayEvent.OnClientEvent:Connect(function(command, payload, extra, extra2, extr
 			return
 		end
 
-		timeline.ProcessedUntilChunk =
-			tonumber(status.processedUntilChunk) or -1
+		if tonumber(status.processedUntilChunk) ~= nil then
+			timeline.ProcessedUntilChunk = tonumber(status.processedUntilChunk)
+		end
 
-		timeline.LiveFromChunk =
-			tonumber(status.liveFromChunk)
+		if tonumber(status.liveFromChunk) ~= nil then
+			timeline.LiveFromChunk = tonumber(status.liveFromChunk)
+		end
 
-		timeline.LiveUntilChunk =
-			tonumber(status.liveUntilChunk) or -1
+		if tonumber(status.liveUntilChunk) ~= nil and tonumber(status.liveUntilChunk) >= 0 then
+			timeline.LiveUntilChunk = math.max(tonumber(timeline.LiveUntilChunk) or -1, tonumber(status.liveUntilChunk))
+		end
 
-		timeline.TotalDuration =
-			tonumber(status.totalDuration)
-			or timeline.TotalDuration
+		local statusDuration = tonumber(status.totalDuration) or 0
+		if statusDuration > 0 then
+			timeline.TotalDuration = math.max(timeline.TotalDuration or 0, statusDuration)
+		end
 
-		timeline.ProcessedUntilTime =
-			tonumber(status.processedUntilTime)
+		if tonumber(status.processedUntilTime) ~= nil and tonumber(status.processedUntilTime) > 0 then
+			timeline.ProcessedUntilTime = tonumber(status.processedUntilTime)
+		end
 
-		timeline.LiveFromTime =
-			tonumber(status.liveFromTime)
+		if tonumber(status.liveFromTime) ~= nil and tonumber(status.liveFromTime) > 0 then
+			timeline.LiveFromTime = tonumber(status.liveFromTime)
+		end
 
-		timeline.LiveUntilTime =
-			tonumber(status.liveUntilTime)
+		local statusLiveUntilTime = tonumber(status.liveUntilTime) or 0
+		if statusLiveUntilTime > 0 then
+			timeline.LiveUntilTime = math.max(tonumber(timeline.LiveUntilTime) or 0, statusLiveUntilTime)
+			timeline.TotalDuration = math.max(timeline.TotalDuration or 0, timeline.LiveUntilTime)
+		end
 
-		timeline.ChunkSize =
-			tonumber(status.chunkSize)
-			or timeline.ChunkSize
+		if tonumber(status.chunkSize) then
+			timeline.ChunkSize = tonumber(status.chunkSize)
+		end
 
-		timeline.FPS =
-			tonumber(status.fps)
-			or timeline.FPS
+		if tonumber(status.fps) then
+			timeline.FPS = tonumber(status.fps)
+		end
 
-		timeline.IsLive =
-			status.liveUntilChunk
-			and status.liveUntilChunk >= 0
-			or timeline.IsLive
+		if status.liveUntilChunk and status.liveUntilChunk >= 0 then
+			timeline.IsLive = true
+		end
 		ensureTimelineTables(timeline)
 
 		if type(status.chunkStates) == "table" then
-			timeline.ChunkStates = status.chunkStates
+			for idx, st in pairs(status.chunkStates) do
+				local numIdx = tonumber(idx)
+				if numIdx then
+					timeline.ChunkStates[numIdx] = st
+				end
+			end
 		end
 
 		table.clear(timeline.ProcessingChunks)
