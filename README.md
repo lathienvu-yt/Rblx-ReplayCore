@@ -100,7 +100,7 @@ The included demo place is only an example of how the system can be integrated.
 ReplayCore is currently distributed as source code rather than as a packaged Roblox asset.
 
 1. Clone or download this repository.
-2. Copy the required files from `Client/` and `Server/` into your experience.
+2. Copy the required files from `Client/` and `Server/` into your experience. (DO NOT USE THIS STEP BECAUSE IT DOESN'T HAVE REQUIRED STUFFS)
 3. Integrate the replay components with your own game systems.
 4. Use `replaycoredemo.rbxl` as a reference for the current implementation.
 
