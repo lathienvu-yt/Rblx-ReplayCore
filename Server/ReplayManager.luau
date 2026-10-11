@@ -4446,8 +4446,8 @@ local function captureServerReplayFrame(stream)
 	pushFrameToRing(stream, frame)
 	if stream.liveMatchId then
 		pushLiveFrames(stream.liveMatchId, { frame })
-		queueReplayFrames(stream, { frame })
 	end
+	queueReplayFrames(stream, { frame })
 end
 
 local function startServerReplayCapture(stream)
@@ -4655,11 +4655,11 @@ ReplayEvent.OnServerEvent:Connect(function(player, command, arg1, arg2, arg3)
 			activeStreamByUser[userId] = streamId
 
 			startReplayProcessor(stream)
-			startServerReplayCapture(stream)
 
 			stream.liveMatchId =
 				registerLiveMatch(stream, metadata)
 
+			startServerReplayCapture(stream)
 			startRingFlushTask(stream)
 
 			ReplayEvent:FireClient(player, "StartStreamAccepted", streamId, stream.liveMatchId)
