@@ -985,8 +985,8 @@ local function StopAndSaveRecording(reason)
 		"elapsed =", workspace:GetServerTimeNow() - startTime
 	)
 
-	if frameCounter == 0 or not streamId then
-		print("[ReplaySystem] Aborting save: No frames captured or missing streamId.")
+	if not streamId then
+		print("[ReplaySystem] Aborting save: Missing streamId.")
 		ReplayEvent:FireServer("RecordingFailed", "No frames were captured.")
 		streamId = nil
 		return
@@ -1011,26 +1011,12 @@ local function StopAndSaveRecording(reason)
 	end)
 end
 
+-- Movement frames are sampled and recorded by ReplayManager on the server.
+-- The client only supplies camera samples for TrueView playback.
 RunService.Heartbeat:Connect(function()
 	if not isRecording or not streamAccepted then return end
-
 	if workspace:GetServerTimeNow() - startTime > MAX_RECORDING_TIME then
 		StopAndSaveRecording("Max time reached")
-		return
-	end
-
-	frameCounter += 1
-	local count = countPlayersInRadius()
-	local interval, precision = getAdaptiveSettings(count)
-	currentPrecision = precision
-
-	if frameCounter % interval ~= 0 then return end
-
-	captureFrame()
-
-	if #pendingFrames >= CHUNK_SIZE then
-		ReplayEvent:FireServer("StreamChunk", streamId, pendingFrames)
-		pendingFrames = {}
 	end
 end)
 
@@ -3264,6 +3250,11 @@ ReplayEvent.OnClientEvent:Connect(function(command, payload, extra, extra2, extr
 		return
 	elseif command == "LivePlayCoreStatus" then
 		print("[LivePlayCore] Status:", payload)
+		return
+	elseif command == "ServerRecordingLimit" then
+		if isRecording and payload == streamId then
+			StopAndSaveRecording("Server recording limit reached")
+		end
 		return
 	elseif command == "StartCameraCapture" then
 		activeCameraStreamId = payload
