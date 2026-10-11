@@ -4366,6 +4366,110 @@ function ReplayCoreServerPlayer.ScrubTimeline(viewer, matchId, targetFrameSeq)
 	return false
 end
 
+local SERVER_REPLAY_SAMPLE_INTERVAL = 1 / 20
+local SERVER_REPLAY_MAX_RADIUS = 180
+local SERVER_REPLAY_KEYFRAME_INTERVAL = 50
+
+local function sanitizeCameraVector(value)
+	if type(value) ~= "table" or #value ~= 3 then return nil end
+	local x, y, z = tonumber(value[1]), tonumber(value[2]), tonumber(value[3])
+	if not x or not y or not z then return nil end
+	if math.abs(x) > 100000 or math.abs(y) > 100000 or math.abs(z) > 100000 then return nil end
+	return { math.floor(x * 1000 + 0.5) / 1000, math.floor(y * 1000 + 0.5) / 1000, math.floor(z * 1000 + 0.5) / 1000 }
+end
+
+local function captureServerReplayFrame(stream)
+	if not stream or stream.serverRecording ~= true then return end
+	local recorder = Players:GetPlayerByUserId(stream.recorderUserId)
+	local recorderCharacter = recorder and recorder.Character
+	local recorderRoot = recorderCharacter and recorderCharacter:FindFirstChild("HumanoidRootPart")
+	if not recorderRoot then return end
+
+	local now = workspace:GetServerTimeNow()
+	local seq = (stream.serverSeq or 0) + 1
+	stream.serverSeq = seq
+	local absolute = seq == 1 or (seq - 1) % SERVER_REPLAY_KEYFRAME_INTERVAL == 0
+	local frame = {
+		t = math.floor((now - stream.serverStartTime) * 1000 + 0.5) / 1000,
+		seq = seq,
+		st = now,
+		players = {},
+		cameras = {},
+		timer = math.max(0, now - stream.serverStartTime),
+		timers = {},
+	}
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		local character = player.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if character and root and (root.Position - recorderRoot.Position).Magnitude <= SERVER_REPLAY_MAX_RADIUS then
+			local key = tostring(player.UserId)
+			local previous = stream.serverPreviousParts[key] or {}
+			local parts = {}
+			for _, part in ipairs(character:GetChildren()) do
+				if part:IsA("BasePart") then
+					local cf = part.CFrame
+					local position = { math.floor(cf.X * 1000 + 0.5) / 1000, math.floor(cf.Y * 1000 + 0.5) / 1000, math.floor(cf.Z * 1000 + 0.5) / 1000 }
+					local rx, ry, rz = cf:ToEulerAnglesXYZ()
+					local rotation = { math.floor(rx * 1000 + 0.5) / 1000, math.floor(ry * 1000 + 0.5) / 1000, math.floor(rz * 1000 + 0.5) / 1000 }
+					local old = previous[part.Name]
+					if absolute or not old then
+						parts[part.Name] = { p = position, r = rotation }
+					else
+						local dp = { position[1] - old.p[1], position[2] - old.p[2], position[3] - old.p[3] }
+						local dr = { rotation[1] - old.r[1], rotation[2] - old.r[2], rotation[3] - old.r[3] }
+						if dp[1] ~= 0 or dp[2] ~= 0 or dp[3] ~= 0 or dr[1] ~= 0 or dr[2] ~= 0 or dr[3] ~= 0 then
+							parts[part.Name] = { dp = dp, dr = dr }
+						end
+					end
+					previous[part.Name] = { p = position, r = rotation }
+				end
+			end
+			stream.serverPreviousParts[key] = previous
+			frame.players[key] = {
+				userId = player.UserId,
+				name = player.Name,
+				displayName = player.DisplayName,
+				isRecorder = player == recorder,
+				parts = parts,
+				anims = {},
+			}
+			frame.timers[key] = math.max(0, now - stream.serverStartTime)
+			local camera = stream.cameraSamples and stream.cameraSamples[player.UserId]
+			if camera and now - camera.receivedAt <= 1 then
+				frame.cameras[key] = { pos = camera.pos, look = camera.look }
+			end
+		end
+	end
+
+	if not next(frame.players) then return end
+	pushFrameToRing(stream, frame)
+	if stream.liveMatchId then
+		pushLiveFrames(stream.liveMatchId, { frame })
+		queueReplayFrames(stream, { frame })
+	end
+end
+
+local function startServerReplayCapture(stream)
+	stream.serverRecording = true
+	stream.serverStartTime = workspace:GetServerTimeNow()
+	stream.serverSeq = 0
+	stream.serverPreviousParts = {}
+	stream.cameraSamples = {}
+	task.spawn(function()
+		while stream.serverRecording and activeStreams[stream.Id] == stream do
+			local tickStart = os.clock()
+			captureServerReplayFrame(stream)
+			task.wait(math.max(0, SERVER_REPLAY_SAMPLE_INTERVAL - (os.clock() - tickStart)))
+			if stream.serverSeq >= 3600 then
+				stream.serverRecording = false
+				local recorder = Players:GetPlayerByUserId(stream.recorderUserId)
+				if recorder then ReplayEvent:FireClient(recorder, "ServerRecordingLimit", stream.Id) end
+			end
+		end
+	end)
+end
+
 --------------------------------------------------
 -- REMOTE EVENT HANDLING
 --------------------------------------------------
@@ -4551,6 +4655,7 @@ ReplayEvent.OnServerEvent:Connect(function(player, command, arg1, arg2, arg3)
 			activeStreamByUser[userId] = streamId
 
 			startReplayProcessor(stream)
+			startServerReplayCapture(stream)
 
 			stream.liveMatchId =
 				registerLiveMatch(stream, metadata)
@@ -4591,9 +4696,7 @@ ReplayEvent.OnServerEvent:Connect(function(player, command, arg1, arg2, arg3)
 		end
 
 		for _, p in ipairs(Players:GetPlayers()) do
-			if p ~= player then
-				ReplayEvent:FireClient(p, "StartCameraCapture", streamId)
-			end
+			ReplayEvent:FireClient(p, "StartCameraCapture", streamId)
 		end
 
 	elseif command == "CameraSample" then
@@ -4601,10 +4704,12 @@ ReplayEvent.OnServerEvent:Connect(function(player, command, arg1, arg2, arg3)
 		local sample = arg2
 		local stream = activeStreams[streamId]
 
-		if stream and stream.recorderUserId then
-			local recorder = Players:GetPlayerByUserId(stream.recorderUserId)
-			if recorder then
-				ReplayEvent:FireClient(recorder, "RemoteCameraSample", player.UserId, sample)
+		if stream and stream.recorderUserId and type(sample) == "table" then
+			local pos = sanitizeCameraVector(sample.pos)
+			local look = sanitizeCameraVector(sample.look)
+			if pos and look then
+				stream.cameraSamples = stream.cameraSamples or {}
+				stream.cameraSamples[player.UserId] = { pos = pos, look = look, receivedAt = workspace:GetServerTimeNow() }
 			end
 		end
 
@@ -4617,6 +4722,9 @@ ReplayEvent.OnServerEvent:Connect(function(player, command, arg1, arg2, arg3)
 		end
 
 		local stream = activeStreams[streamId]
+		if stream and stream.serverRecording then
+			return
+		end
 		if stream and type(frameChunk) == "table" then
 			local metrics = stream.metrics or {}
 
@@ -4690,6 +4798,7 @@ ReplayEvent.OnServerEvent:Connect(function(player, command, arg1, arg2, arg3)
 		if not stream then
 			return
 		end
+		stream.serverRecording = false
 		clearPlayerStream(player)
 		finalizeReplay(player, streamId, stream, arg2, arg3, false)
 
