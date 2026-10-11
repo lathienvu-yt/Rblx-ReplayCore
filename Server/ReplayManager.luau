@@ -2834,9 +2834,7 @@ local function finalizeReplay(player, streamId, payload, sounds, markers, isRage
 	waitForReplayProcessing(payload)
 
 	for _, p in ipairs(Players:GetPlayers()) do
-		if p ~= player then
-			ReplayEvent:FireClient(p, "StopCameraCapture")
-		end
+		ReplayEvent:FireClient(p, "StopCameraCapture")
 	end
 
 	if type(sounds) == "table" then
@@ -4658,6 +4656,10 @@ ReplayEvent.OnServerEvent:Connect(function(player, command, arg1, arg2, arg3)
 
 			stream.liveMatchId =
 				registerLiveMatch(stream, metadata)
+
+			for _, p in ipairs(Players:GetPlayers()) do
+				ReplayEvent:FireClient(p, "StartCameraCapture", streamId)
+			end
 
 			startServerReplayCapture(stream)
 			startRingFlushTask(stream)
