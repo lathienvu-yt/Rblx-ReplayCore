@@ -1,3 +1,6 @@
+> [!CAUTION]
+> This is an entirely new branch for experimental server-sided recording, i am not responsible for any damage the new update causes
+
 # Roblox ReplayCore
 
 A modern Roblox replay system for competitive gaming and replay-heavy experiences.
